@@ -1,0 +1,102 @@
+import { logger } from "../../../../logger/index.js";
+import { compressToBase64 } from "../../../compress.js";
+import { PackageCacheBase } from "./base.js";
+import { DateTime } from "luxon";
+import upath from "upath";
+import cacache from "cacache";
+import { LRUCache } from "lru-cache";
+//#region lib/util/cache/package/impl/file.ts
+var PackageCacheFile = class PackageCacheFile extends PackageCacheBase {
+	static create(cacheDir) {
+		const cacheFileName = upath.join(cacheDir, "/renovate/renovate-cache-v1");
+		logger.debug(`Initializing Renovate internal cache into ${cacheFileName}`);
+		return new PackageCacheFile(cacheFileName);
+	}
+	cacheFileName;
+	expiryMap = new LRUCache({ max: 1e5 });
+	constructor(cacheFileName) {
+		super();
+		this.cacheFileName = cacheFileName;
+	}
+	getKey(namespace, key) {
+		return `${namespace}-${key}`;
+	}
+	async set(namespace, key, value, hardTtlMinutes) {
+		logger.trace({
+			namespace,
+			key,
+			hardTtlMinutes
+		}, "Saving cached value");
+		const compressedValue = await compressToBase64(JSON.stringify(value));
+		const expiry = DateTime.local().plus({ minutes: hardTtlMinutes });
+		const payload = JSON.stringify({
+			value: compressedValue,
+			expiry
+		});
+		await cacache.put(this.cacheFileName, this.getKey(namespace, key), payload);
+		this.expiryMap.set(this.getKey(namespace, key), expiry);
+	}
+	async destroy() {
+		logger.debug("Checking file package cache for expired items");
+		let totalCount = 0;
+		let deletedCount = 0;
+		let errorCount = 0;
+		const startTime = Date.now();
+		for await (const item of cacache.ls.stream(this.cacheFileName)) try {
+			totalCount += 1;
+			const cacheEntry = item;
+			const cachedExpiry = this.expiryMap.get(cacheEntry.key);
+			if (cachedExpiry !== void 0) {
+				if (DateTime.local() <= cachedExpiry) continue;
+				await cacache.rm.entry(this.cacheFileName, cacheEntry.key);
+				await cacache.rm.content(this.cacheFileName, cacheEntry.integrity);
+				this.expiryMap.delete(cacheEntry.key);
+				deletedCount += 1;
+				continue;
+			}
+			const entry = await cacache.get(this.cacheFileName, cacheEntry.key);
+			let cached;
+			try {
+				const raw = entry.data.toString();
+				cached = JSON.parse(raw);
+			} catch {
+				logger.debug("Error parsing cached value - deleting");
+			}
+			if (cached) {
+				if (!cached.expiry) continue;
+				const expiry = DateTime.fromISO(cached.expiry);
+				if (expiry.isValid && DateTime.local() <= expiry) continue;
+			}
+			await cacache.rm.entry(this.cacheFileName, cacheEntry.key);
+			await cacache.rm.content(this.cacheFileName, cacheEntry.integrity);
+			deletedCount += 1;
+		} catch (err) {
+			logger.trace({ err }, "Error cleaning up cache entry");
+			errorCount += 1;
+		}
+		if (errorCount > 0) logger.debug(`Error count cleaning up cache: ${errorCount}`);
+		const durationMs = Date.now() - startTime;
+		logger.debug(`Deleted ${deletedCount} of ${totalCount} file cached entries in ${durationMs}ms`);
+	}
+	async readRaw(namespace, key) {
+		const cacheKey = this.getKey(namespace, key);
+		try {
+			return (await cacache.get(this.cacheFileName, cacheKey)).data;
+		} catch {
+			return;
+		}
+	}
+	async rm(namespace, key) {
+		logger.trace({
+			namespace,
+			key
+		}, "Removing cache entry");
+		const cacheKey = this.getKey(namespace, key);
+		await cacache.rm.entry(this.cacheFileName, cacheKey);
+		this.expiryMap.delete(cacheKey);
+	}
+};
+//#endregion
+export { PackageCacheFile };
+
+//# sourceMappingURL=file.js.map
